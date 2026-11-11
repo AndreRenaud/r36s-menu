@@ -57,7 +57,7 @@ func cleanTitle(name string, dir bool) string {
 // hidden, and so are folders without ROMs. Folders come first, then ROMs,
 // each in alphabetical order.
 func Scan(root string) *Entry {
-	top := &Entry{Name: filepath.Base(root), Title: "my tapes", Path: root}
+	top := &Entry{Name: filepath.Base(root), Path: root} // the top level has no title
 	scanDir(top, 0)
 	return top
 }

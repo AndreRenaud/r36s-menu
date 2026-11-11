@@ -185,6 +185,7 @@ type game struct {
 	tapes    map[*Entry]*ebiten.Image
 	scene    *ebiten.Image // the window pane without the rain
 	sceneFor *Entry
+	scroll   titleScroll
 
 	// Folder change animation
 	trans, transDir int
@@ -261,6 +262,7 @@ func (g *game) rescan() {
 	}
 	g.dir, g.sel = g.root, 0
 	g.trans, g.shake, g.fromDir = 0, 0, nil
+	g.scroll.entry = nil
 	for _, img := range g.tapes {
 		img.Deallocate()
 	}
@@ -309,6 +311,7 @@ func (g *game) pressed(name string, down bool, repeat bool) bool {
 
 func (g *game) Update() error {
 	g.tick++
+	g.scroll.tick++
 	select {
 	case <-g.reload:
 		// Stay where we are: rescan goes back to the saved position
@@ -883,24 +886,7 @@ func (g *game) tapeImage(e *Entry) *ebiten.Image {
 	if img, ok := g.tapes[e]; ok {
 		return img
 	}
-	img := ebiten.NewImage(tapeW, tapeH)
-	roundRect(img, 0, 0, tapeW, tapeH, 7, colTape)
-	label := paletteFor(e).tape
-	lx, lw := float32(30), float32(tapeW-60)
-	if e.IsDir() {
-		// A box of tapes: a wider label and a stack mark instead of reels
-		label = color.RGBA{0xc6, 0xb9, 0xd8, 0xff}
-		lx, lw = 30, tapeW-38
-		for i := 0; i < 3; i++ {
-			roundRect(img, 8, 10+float32(i)*7, 14, 4, 1.5, colReel)
-		}
-	}
-	roundRect(img, lx, 6, lw, tapeH-12, 3, label)
-	title := e.Title
-	if e.IsDir() {
-		title += "  ›"
-	}
-	drawText(img, fit(title, g.fTape, float64(lw)-14), g.fTape, float64(lx)+7, 6, colInk)
+	img := g.renderTape(e, true)
 	g.tapes[e] = img
 	if len(g.tapes) > 64 {
 		for k, v := range g.tapes {
@@ -912,6 +898,90 @@ func (g *game) tapeImage(e *Entry) *ebiten.Image {
 		}
 	}
 	return img
+}
+
+// tapeLabel is where a cassette's title goes: its text and the left edge
+// and width of the space for it.
+func tapeLabel(e *Entry) (title string, x, w float64) {
+	if e.IsDir() {
+		return e.Title + "  ›", 30 + 7, tapeW - 38 - 14
+	}
+	return e.Title, 30 + 7, tapeW - 60 - 14
+}
+
+func (g *game) renderTape(e *Entry, withTitle bool) *ebiten.Image {
+	img := ebiten.NewImage(tapeW, tapeH)
+	roundRect(img, 0, 0, tapeW, tapeH, 7, colTape)
+	label := paletteFor(e).tape
+	title, tx, tw := tapeLabel(e)
+	if e.IsDir() {
+		// A box of tapes: a wider label and a stack mark instead of reels
+		label = color.RGBA{0xc6, 0xb9, 0xd8, 0xff}
+		for i := 0; i < 3; i++ {
+			roundRect(img, 8, 10+float32(i)*7, 14, 4, 1.5, colReel)
+		}
+	}
+	roundRect(img, float32(tx)-7, 6, float32(tw)+14, tapeH-12, 3, label)
+	if withTitle {
+		drawText(img, fit(title, g.fTape, tw), g.fTape, tx, 6, colInk)
+	}
+	return img
+}
+
+// A title too long for its cassette slides back and forth while the
+// cassette is selected, so that all of it can be read.
+const (
+	scrollPause = 50  // ticks at each end
+	scrollSpeed = 0.5 // pixels a tick
+)
+
+type titleScroll struct {
+	entry *Entry
+	tick  int
+	blank *ebiten.Image // the cassette without its title
+	strip *ebiten.Image // the whole title
+	over  float64       // how much wider the title is than its space
+}
+
+// scrollFor returns the sliding title for the selected entry, or nil if its
+// title fits.
+func (g *game) scrollFor(e *Entry) *titleScroll {
+	sc := &g.scroll
+	if sc.entry != e {
+		if sc.blank != nil {
+			sc.blank.Deallocate()
+			sc.strip.Deallocate()
+			sc.blank, sc.strip = nil, nil
+		}
+		sc.entry, sc.tick, sc.over = e, 0, 0
+		title, _, tw := tapeLabel(e)
+		if w := textWidth(title, g.fTape); w > tw {
+			sc.over = w - tw
+			sc.blank = g.renderTape(e, false)
+			sc.strip = ebiten.NewImage(int(math.Ceil(w))+2, tapeH)
+			drawText(sc.strip, title, g.fTape, 0, 6, colInk)
+		}
+	}
+	if sc.blank == nil {
+		return nil
+	}
+	return sc
+}
+
+// offset is how far the title has slid: rest, slide to the end, rest, slide
+// back.
+func (sc *titleScroll) offset() float64 {
+	travel := int(sc.over / scrollSpeed)
+	t := sc.tick % (2*scrollPause + 2*travel)
+	switch {
+	case t < scrollPause:
+		return 0
+	case t < scrollPause+travel:
+		return float64(t-scrollPause) * scrollSpeed
+	case t < 2*scrollPause+travel:
+		return sc.over
+	}
+	return sc.over - float64(t-2*scrollPause-travel)*scrollSpeed
 }
 
 func (g *game) reelImage() *ebiten.Image {
@@ -964,9 +1034,24 @@ func (g *game) drawListAt(dst *ebiten.Image, dir *Entry, sel int, ox, oy float64
 			place(op, -8, -8)
 			dst.DrawImage(ring, op)
 		}
+		var sc *titleScroll
+		if on && dir == g.dir {
+			sc = g.scrollFor(e)
+		}
 		op := &ebiten.DrawImageOptions{}
 		place(op, 0, 0)
-		dst.DrawImage(g.tapeImage(e), op)
+		if sc == nil {
+			dst.DrawImage(g.tapeImage(e), op)
+		} else {
+			dst.DrawImage(sc.blank, op)
+			// The part of the title that is in view
+			_, tx, tw := tapeLabel(e)
+			off := sc.offset()
+			view := sc.strip.SubImage(image.Rect(int(off), 0, int(off)+int(tw), tapeH)).(*ebiten.Image)
+			op := &ebiten.DrawImageOptions{}
+			place(op, tx, 0)
+			dst.DrawImage(view, op)
+		}
 		if !e.IsDir() {
 			for _, rx := range []float64{15, tapeW - 15} {
 				op := &ebiten.DrawImageOptions{}
